@@ -64,24 +64,49 @@ class _HostScreenState extends State<HostScreen> {
     super.dispose();
   }
 
-  Future<bool> _ensureLocationPermission() async {
+  /// Requests what hotspot mode needs on this OS version.
+  ///
+  /// Android 12 (API 31) split Wi-Fi control out of the location permission:
+  /// `startLocalOnlyHotspot` now throws a SecurityException unless
+  /// NEARBY_WIFI_DEVICES is granted, and asking for location alone is not
+  /// enough. Both are requested because older versions still gate on
+  /// location, and requesting an already-granted permission is a no-op.
+  Future<bool> _ensureHotspotPermissions() async {
     if (!Platform.isAndroid) return true;
-    final status = await Permission.location.request();
-    if (status.isGranted) return true;
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        // ignore: prefer_const_constructors
-        SnackBar(
-          content: const Text('Location permission is required for hotspot.'),
-          // ignore: prefer_const_constructors
-          action: SnackBarAction(
-            label: 'SETTINGS',
-            onPressed: openAppSettings,
-          ),
-        ),
+
+    // Pre-Android 12 gates hotspot creation on location.
+    final location = await Permission.location.request();
+    if (!location.isGranted) {
+      _showPermissionSnackBar(
+        'Location permission is required to start a hotspot.',
       );
+      return false;
     }
-    return false;
+
+    // Android 12+ additionally requires NEARBY_WIFI_DEVICES.
+    final nearby = await Permission.nearbyWifiDevices.request();
+    if (!nearby.isGranted) {
+      _showPermissionSnackBar(
+        '“Nearby devices” permission is required to start a hotspot '
+        'on Android 12 and newer.',
+      );
+      return false;
+    }
+
+    return true;
+  }
+
+  void _showPermissionSnackBar(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        action: const SnackBarAction(
+          label: 'SETTINGS',
+          onPressed: openAppSettings,
+        ),
+      ),
+    );
   }
 
   Future<void> _createIntercom() async {
@@ -100,7 +125,7 @@ class _HostScreenState extends State<HostScreen> {
     }
 
     if (_useHotspot) {
-      final granted = await _ensureLocationPermission();
+      final granted = await _ensureHotspotPermissions();
       if (!granted || !mounted) return;
     }
 

@@ -1,7 +1,10 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/services.dart';
 import 'package:wifi_iot/wifi_iot.dart';
+
+import '../utils/constants.dart';
 
 class HotspotService {
   bool _isActive = false;
@@ -43,16 +46,26 @@ class HotspotService {
         return false;
       }
 
-      bool hotspotReady = false;
-      for (int i = 0; i < 10; i++) {
-        await Future.delayed(const Duration(seconds: 1));
+      // Poll briefly, checking first so a hotspot that is already up does not
+      // cost a pointless second of delay.
+      var hotspotReady = await WiFiForIoTPlugin.isWiFiAPEnabled();
+      for (var i = 0; i < 5 && !hotspotReady; i++) {
+        await Future<void>.delayed(
+          const Duration(milliseconds: AppConstants.hotspotPollMs),
+        );
         hotspotReady = await WiFiForIoTPlugin.isWiFiAPEnabled();
-        if (hotspotReady) break;
       }
 
       if (!hotspotReady) {
-        _errorController.add('Hotspot did not start. Try again or use Wi-Fi.');
-        await WiFiForIoTPlugin.setWiFiAPEnabled(false);
+        _errorController.add(
+          'The hotspot did not come up within a few seconds. Try again, or '
+          'use Wi-Fi — the room works the same way on either.',
+        );
+        try {
+          await WiFiForIoTPlugin.setWiFiAPEnabled(false);
+        } catch (_) {
+          // Best effort: we are already reporting a failure.
+        }
         return false;
       }
 
@@ -71,10 +84,44 @@ class HotspotService {
       _isActive = true;
       _statusController.add(true);
       return true;
+    } on PlatformException catch (e) {
+      _errorController.add(_describe(e));
+      return false;
     } catch (e) {
-      _errorController.add('Hotspot error: $e');
+      // Never surface a raw exception: `PlatformException.toString()` includes
+      // the full Java stack trace, which is unreadable in the UI and tells the
+      // user nothing actionable.
+      _errorController.add(
+        'Could not start the hotspot. Some Android versions block this — '
+        'connecting to Wi-Fi and using that network instead works either way.',
+      );
       return false;
     }
+  }
+
+  /// Turns a [PlatformException] into one actionable sentence.
+  ///
+  /// Android is inconsistent here: the same failure surfaces as a
+  /// `SecurityException`, a `RemoteException` or a bare error code depending on
+  /// the OEM and API level, so match on the message text.
+  static String _describe(PlatformException e) {
+    final text = '${e.code} ${e.message ?? ''}';
+
+    if (text.contains('nearby devices')) {
+      return 'Android needs “Nearby devices” permission before it can start a '
+          'hotspot. Grant it in Settings, or connect to Wi-Fi instead.';
+    }
+    if (text.contains('SecurityException')) {
+      return 'Android denied permission to start the hotspot. Grant '
+          '“Nearby devices” and location in Settings, or use Wi-Fi.';
+    }
+    if (e.code == 'alreadyActive' || text.contains('already')) {
+      return 'A hotspot is already running on this device.';
+    }
+    // Some OEM builds report a bare failure with no detail; say so plainly
+    // rather than leaking internals.
+    return 'Could not start the hotspot on this device. Some Android builds '
+        'block apps from doing this — using Wi-Fi works either way.';
   }
 
   Future<void> stopHotspot() async {

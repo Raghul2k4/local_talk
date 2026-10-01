@@ -51,7 +51,10 @@ class AppConstants {
   /// Normalised RMS above which a sender is considered to be talking.
   static const double speakingThreshold = 0.06;
 
-  /// Maximum audio frames buffered per client before the oldest is dropped.
+  /// How often to poll for the hotspot to come up after enabling it.
+  static const int hotspotPollMs = 600;
+
+  /// Max audio frames buffered per client before the oldest is dropped.
   /// Keeps a stalled client from growing the queue without bound.
   static const int maxQueuedAudioFrames = 40;
 
