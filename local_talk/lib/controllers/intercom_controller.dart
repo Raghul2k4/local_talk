@@ -10,6 +10,7 @@ import '../services/audio_service.dart';
 import '../services/client_service.dart';
 import '../services/host_service.dart';
 import '../services/hotspot_service.dart';
+import '../services/session_keeper.dart';
 import '../services/websocket_service.dart';
 import '../utils/constants.dart';
 
@@ -39,6 +40,7 @@ class IntercomController extends ChangeNotifier {
   StreamSubscription<double>? _levelSub;
 
   HotspotService? _hotspotService;
+  final SessionKeeper _sessionKeeper = SessionKeeper();
   bool _isHotspotActive = false;
   String? _hotspotSsid;
   String? _hotspotPassword;
@@ -206,6 +208,10 @@ class IntercomController extends ChangeNotifier {
 
     try {
       await host.start();
+      // Keep the session alive: screen on, foreground service, audio focus.
+      // Without this, backgrounding the app can suspend the process and the
+      // room dies for everyone.
+      await _sessionKeeper.start();
       await _audioService?.startPlayback();
       _connectionStatus = ConnectionStatus.connected;
     } catch (e) {
@@ -267,6 +273,9 @@ class IntercomController extends ChangeNotifier {
         await client.joinChannel(firstChannel);
       }
       await _audioService?.startPlayback();
+      // Clients need the same protections: a backgrounded client gets
+      // suspended and silently stops receiving audio.
+      await _sessionKeeper.start();
       _connectionStatus = ConnectionStatus.connected;
     } on JoinException catch (e) {
       _error = e.message;
@@ -566,6 +575,9 @@ class IntercomController extends ChangeNotifier {
 
   Future<void> _teardownServices() async {
     _cancelStreamSubs();
+    // Release the wakelock and foreground service before anything else, so we
+    // never leave a notification or a held screen behind.
+    await _sessionKeeper.stop();
     try {
       await _hostService?.stop();
     } catch (_) {}

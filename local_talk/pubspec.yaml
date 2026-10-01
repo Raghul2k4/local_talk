@@ -20,6 +20,9 @@ dependencies:
   uuid: ^4.0.0
   shared_preferences: ^2.5.5
   crypto: ^3.0.3
+  wakelock_plus: ^1.8.0
+  audio_session: ^0.2.4
+  flutter_foreground_task: ^11.0.3
 
 dev_dependencies:
   flutter_test:
