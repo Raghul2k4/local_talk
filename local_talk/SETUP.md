@@ -91,6 +91,7 @@ host playback and private-call isolation are all covered without a device.
 - Audio is raw PCM16, 16 kHz mono, ~58 ms per WebSocket frame.
 - Bandwidth is roughly 256 kbit/s per transmitting device. For larger rooms,
   switching both ends to an Opus codec (`Codec.opus` in `flutter_sound`) would cut
-  this by roughly 8x — see the roadmap in `README.md`.
-- Host audio is routed by channel on the host device; see `AGENTS.md` for the
-  routing rules and the tests that protect them.
+  this by roughly 8x — see the roadmap in the [repository README](../README.md).
+- Host audio is routed by channel on the host device; see the
+  [repository README](../README.md#networking) for the routing rules and the tests
+  that protect them.

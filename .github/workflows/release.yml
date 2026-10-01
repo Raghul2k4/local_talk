@@ -1,0 +1,77 @@
+name: Release
+
+# Publishing a download for viewers: tag the repo and the APKs are attached to a
+# GitHub Release, which is what the README "Download" section links to.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build a release for (e.g. v1.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    working-directory: local_talk
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: stable
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build universal release APK
+        run: flutter build apk --release
+
+      - name: Build split release APKs
+        run: flutter build apk --release --split-per-abi
+
+      - name: Collect and rename APKs
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-release.apk \
+             dist/local-talk-universal-release.apk
+          for apk in build/app/outputs/flutter-apk/app-*-release.apk; do
+            [ -e "$apk" ] || continue
+            abi=$(basename "$apk" | sed -E 's/^app-(.*)-release\.apk$/\1/')
+            cp "$apk" "dist/local-talk-${abi}-release.apk"
+          done
+          ls -l dist
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.apk > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload APKs as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-talk-apk
+          path: local_talk/dist/
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: LocalTalk ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            local_talk/dist/*.apk
+            local_talk/dist/SHA256SUMS.txt
