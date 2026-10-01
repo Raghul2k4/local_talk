@@ -1,0 +1,30 @@
+name: local_talk
+description: Local Wi-Fi push-to-talk intercom
+publish_to: 'none'
+version: 1.1.0+2
+
+environment:
+  # The code uses Dart 3 patterns (switch expressions, pattern matching in
+  # connection_status_indicator.dart), so 3.0 is a real floor, not a guess.
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_sound: ^9.2.13
+  web_socket_channel: ^3.0.0
+  permission_handler: ^11.0.1
+  connectivity_plus: ^7.3.1
+  wifi_iot: ^0.3.18
+  provider: ^6.1.1
+  uuid: ^4.0.0
+  shared_preferences: ^2.5.5
+  crypto: ^3.0.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
