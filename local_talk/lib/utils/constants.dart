@@ -27,6 +27,17 @@ class AppConstants {
   static const int maxReconnectAttempts = 6;
   static const int connectionTimeoutMs = 8000;
 
+  /// Ceiling for the exponential reconnect backoff.
+  ///
+  /// Deliberately modest: with six attempts the total wait to give up is
+  /// ~30 s. A longer ceiling sounds kinder but leaves a user staring at
+  /// "Reconnecting…" for a minute and a half after the host is long gone.
+  static const int reconnectMaxDelayMs = 6000;
+
+  /// A socket that connects but never registers is closed after this long, so a
+  /// half-open or malicious connection cannot hold memory indefinitely.
+  static const int registrationTimeoutMs = 10000;
+
   static const int heartbeatIntervalMs = 10000;
 
   /// A client that has not been heard from for this long is dropped by the
@@ -45,6 +56,10 @@ class AppConstants {
   static const int maxQueuedAudioFrames = 40;
 
   static const int maxClients = 24;
+
+  /// Hard cap on raw WebSocket sockets, registered or not. Leaves headroom
+  /// above [maxClients] for clients mid-reconnect.
+  static const int maxSockets = maxClients * 2;
 
   static const List<String> defaultChannels = ['General', 'Team A', 'Team B'];
 

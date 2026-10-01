@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -14,8 +15,22 @@ class ClientService implements WebSocketService {
   final String _username;
   final String _hostIp;
   final String? _pin;
+
+  /// Port the host listens on. Injectable so tests can point at an ephemeral
+  /// port instead of the real [AppConstants.wsPort].
+  final int port;
+
   bool _stopped = false;
   bool _isReconnecting = false;
+
+  /// Per-instance RNG for reconnect jitter. Seeding per client (rather than
+  /// using a shared global) keeps two devices on the same phone from colliding.
+  final Random _random = Random();
+
+  /// Private call this device was in before a drop, so it can be re-established
+  /// on reconnect. Without this a call silently becomes a normal channel chat.
+  String? _privateCallPartnerId;
+  bool _wasInPrivateCall = false;
   Timer? _heartbeatTimer;
   Timer? _reconnectTimer;
   int _reconnectAttempts = 0;
@@ -27,7 +42,7 @@ class ClientService implements WebSocketService {
   String? _roomId;
   bool _hasPin = false;
 
-  /// Channel this device is in. Remembered so a reconnect can rejoin it —
+  /// Channel this device is in. Remembered so a reconnect can rejoin it â€”
   /// otherwise the host would place us back on no channel at all, and the
   /// device would silently start hearing every channel in the room.
   String? _currentChannelId;
@@ -51,6 +66,7 @@ class ClientService implements WebSocketService {
     required String hostIp,
     required String username,
     String? pin,
+    this.port = AppConstants.wsPort,
   })  : _hostIp = hostIp.trim(),
         _username = username.trim().isEmpty
             ? AppConstants.defaultUsername
@@ -66,6 +82,7 @@ class ClientService implements WebSocketService {
   @override
   Stream<String> get errorStream => _errorController.stream;
 
+  @override
   Stream<List<int>> get audioStream => _audioController.stream;
 
   @override
@@ -75,14 +92,37 @@ class ClientService implements WebSocketService {
   @override
   Stream<RoomInfo> get roomInfoStream => _roomInfoController.stream;
 
+  @override
   Stream<WsMessage> get messageStream => _messageController.stream;
 
   String? get localUserId => _localUserId;
   String? get localUsername => _localUsername;
   List<Channel> get channels => _channels;
 
+  /// True only while we have a live, usable connection.
+  ///
+  /// Derived from [connectionStatus] rather than `_channel != null`: the
+  /// channel field is not cleared when the socket dies or a join is rejected,
+  /// so the old check reported `true` while the client was permanently
+  /// disconnected — which the UI used to decide whether to offer controls that
+  /// could not work.
   @override
-  bool get isRunning => _channel != null && !_stopped;
+  bool get isRunning => _connectionStatus == ConnectionStatus.connected;
+
+  /// Last status pushed on [connectionStatusStream]. Exposed so callers can
+  /// read the current state without subscribing.
+  ConnectionStatus get connectionStatus => _connectionStatus;
+
+  ConnectionStatus _connectionStatus = ConnectionStatus.disconnected;
+
+  /// Single point for status changes so the field can never drift from the
+  /// stream the UI actually listens to.
+  void _emitStatus(ConnectionStatus status) {
+    _connectionStatus = status;
+    _connectionStatusController.add(status);
+  }
+
+  Uri _uri() => Uri.parse('ws://$_hostIp:$port');
 
   @override
   Future<void> start() => connect();
@@ -92,9 +132,9 @@ class ClientService implements WebSocketService {
   Future<String> connect() async {
     _stopped = false;
     _reconnectAttempts = 0;
-    _connectionStatusController.add(ConnectionStatus.connecting);
+    _emitStatus(ConnectionStatus.connecting);
 
-    final uri = Uri.parse('ws://$_hostIp:${AppConstants.wsPort}');
+    final uri = _uri();
     final channel = WebSocketChannel.connect(uri);
     _channel = channel;
 
@@ -105,7 +145,7 @@ class ClientService implements WebSocketService {
       );
     } catch (e) {
       await _teardownSocket();
-      _connectionStatusController.add(ConnectionStatus.disconnected);
+      _emitStatus(ConnectionStatus.disconnected);
       throw JoinException(
         'Could not reach the host.\n'
         'Double-check the IP address and make sure both devices are on the '
@@ -128,6 +168,10 @@ class ClientService implements WebSocketService {
         'Make sure the host room is still running.',
       ),
     );
+    // Set on success only: `isRunning` is derived from this, and the rejection
+    // paths must leave it false.
+    _emitStatus(ConnectionStatus.connected);
+    _isRunningController.add(true);
     return welcome;
   }
 
@@ -231,6 +275,31 @@ class ClientService implements WebSocketService {
           }
           _messageController.add(msg);
           break;
+        case 'private_call_request':
+          _messageController.add(msg);
+          break;
+        case 'private_call_started':
+          // The host confirmed a private call: remember the partner so a
+          // reconnect can re-establish it.
+          _privateCallPartnerId = msg.data?['partnerId'] as String?;
+          _wasInPrivateCall = _privateCallPartnerId != null;
+          _messageController.add(msg);
+          break;
+        case 'private_call_ended':
+        case 'private_call_rejected':
+          _privateCallPartnerId = null;
+          _wasInPrivateCall = false;
+          _messageController.add(msg);
+          break;
+        case 'private_call_unavailable':
+          // Our partner did not come back; degrade to normal channel audio.
+          _privateCallPartnerId = null;
+          _wasInPrivateCall = false;
+          _errorController.add(
+            (msg.data?['message'] as String?) ??
+                'The private call could not be restored.',
+          );
+          break;
         case 'error':
           _errorController
               .add((msg.data?['message'] as String?) ?? 'Unknown server error');
@@ -275,7 +344,7 @@ class ClientService implements WebSocketService {
     if (_stopped) return;
     _heartbeatTimer?.cancel();
     _isRunningController.add(false);
-    _connectionStatusController.add(ConnectionStatus.reconnecting);
+    _emitStatus(ConnectionStatus.reconnecting);
     _scheduleReconnect(reason);
   }
 
@@ -283,21 +352,38 @@ class ClientService implements WebSocketService {
     if (_stopped || _isReconnecting) return;
     if (_reconnectAttempts >= AppConstants.maxReconnectAttempts) {
       _errorController.add('Lost connection to the host.');
-      _connectionStatusController.add(ConnectionStatus.disconnected);
+      _emitStatus(ConnectionStatus.disconnected);
       _messageController.add(const WsMessage(type: 'connection_lost'));
       return;
     }
     _isReconnecting = true;
     _reconnectAttempts++;
-    _connectionStatusController.add(ConnectionStatus.reconnecting);
+    _emitStatus(ConnectionStatus.reconnecting);
     _reconnectTimer = Timer(
-      const Duration(milliseconds: AppConstants.reconnectDelayMs),
+      _reconnectDelay(),
       () {
         _isReconnecting = false;
         if (_stopped) return;
         _reconnect();
       },
     );
+  }
+
+  /// Exponential backoff with jitter.
+  ///
+  /// Without jitter every client in the room retries on the same tick after a
+  /// host hiccup, so the host is hit by N simultaneous reconnects at once â€”
+  /// exactly when it is least able to serve them. Randomising each device's
+  /// delay spreads the load and makes the recovery survivable.
+  Duration _reconnectDelay() {
+    final attempt = _reconnectAttempts - 1;
+    final base = AppConstants.reconnectDelayMs * (1 << attempt.clamp(0, 4));
+    final capped = base.clamp(
+      AppConstants.reconnectDelayMs,
+      AppConstants.reconnectMaxDelayMs,
+    );
+    final jitter = 1.0 + (_random.nextDouble() * 2 - 1) * 0.3;
+    return Duration(milliseconds: (capped * jitter).round());
   }
 
   /// Joins (or switches to) a channel. The choice is remembered so it can be
@@ -316,9 +402,18 @@ class ClientService implements WebSocketService {
   /// Channel this device is currently in, if any.
   String? get currentChannelId => _currentChannelId;
 
+  /// Partner of the private call this device is in, if any. Exposed so the
+  /// controller and tests can observe call state without parsing messages.
+  String? get privateCallPartnerId => _privateCallPartnerId;
+
+  /// Whether a private call is currently up. Distinct from
+  /// [privateCallPartnerId] because the partner is retained across a
+  /// reconnect while the call itself may be down.
+  bool get isInPrivateCall => _wasInPrivateCall;
+
   Future<void> _reconnect() async {
     try {
-      final uri = Uri.parse('ws://$_hostIp:${AppConstants.wsPort}');
+      final uri = _uri();
       final channel = WebSocketChannel.connect(uri);
       _channel = channel;
       await channel.ready.timeout(
@@ -344,7 +439,16 @@ class ClientService implements WebSocketService {
           data: {'channelId': channelId},
         ));
       }
-      _connectionStatusController.add(ConnectionStatus.connected);
+      // Re-establish an interrupted private call. If the partner is gone the
+      // host answers `private_call_unavailable` and we fall back to the
+      // channel, which is the correct graceful degradation.
+      if (_wasInPrivateCall && _privateCallPartnerId != null) {
+        _sendJson(WsMessage(
+          type: 'private_call',
+          data: {'targetId': _privateCallPartnerId},
+        ));
+      }
+      _emitStatus(ConnectionStatus.connected);
       _reconnectAttempts = 0;
     } catch (_) {
       _onSocketLost('Connection error');
@@ -372,17 +476,26 @@ class ClientService implements WebSocketService {
   Future<void> stop() async {
     _stopped = true;
     _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
     _reconnectTimer?.cancel();
     _isReconnecting = false;
     try {
       await _channel?.sink.close();
     } catch (_) {}
     _channel = null;
-    _isRunningController.add(false);
-    _connectionStatusController.add(ConnectionStatus.disconnected);
+    // `dispose()` may already have closed these; stop() and dispose() are
+    // called in both orders.
+    if (!_disposed) {
+      _isRunningController.add(false);
+      _emitStatus(ConnectionStatus.disconnected);
+    }
   }
 
+  bool _disposed = false;
+
   void dispose() {
+    if (_disposed) return;
+    _disposed = true;
     _usersController.close();
     _isRunningController.close();
     _errorController.close();

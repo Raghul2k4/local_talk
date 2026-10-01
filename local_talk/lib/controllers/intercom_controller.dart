@@ -256,8 +256,6 @@ class IntercomController extends ChangeNotifier {
       _audioService?.feedAudioData(data);
     });
 
-    _messageSub = client.messageStream.listen(_handleMessage);
-
     try {
       await client.connect();
       // Join the first channel by default so audio flows immediately.
@@ -310,10 +308,9 @@ class IntercomController extends ChangeNotifier {
       _roomInfo = info;
       notifyListeners();
     });
-    if (isHost) {
-      _messageSub =
-          (service as HostService).messageStream.listen(_handleMessage);
-    }
+    // Control messages are part of the contract for both roles now, so this
+    // needs no per-role branch and no downcast.
+    _messageSub = service.messageStream.listen(_handleMessage);
   }
 
   void _cancelStreamSubs() {

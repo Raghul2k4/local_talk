@@ -138,9 +138,11 @@ class HostService implements WebSocketService {
   @override
   Stream<RoomInfo> get roomInfoStream => _roomInfoController.stream;
 
+  @override
   Stream<WsMessage> get messageStream => _messageController.stream;
 
   /// Audio frames arriving from clients (host listens to these).
+  @override
   Stream<List<int>> get audioStream => _audioController.stream;
 
   @override
@@ -228,15 +230,50 @@ class HostService implements WebSocketService {
         } catch (_) {}
         return;
       }
+      // Separate, looser cap on raw sockets. Since `maxClients` only counts
+      // registered users, nothing else would otherwise stop a peer from
+      // opening connections and never registering.
+      if (_clients.length >= AppConstants.maxSockets) {
+        try {
+          final rejected = await WebSocketTransformer.upgrade(request);
+          _sendTo(
+            rejected,
+            const WsMessage(
+              type: 'error',
+              data: {'message': 'Too many connections'},
+            ),
+          );
+          await rejected.close(1013, 'Too many connections');
+        } catch (_) {}
+        return;
+      }
       try {
         final socket = await WebSocketTransformer.upgrade(request);
         _clients.add(socket);
         _lastSeen[socket] = DateTime.now();
         _pendingFrames[socket] = 0;
+        // A socket that connects but never registers would otherwise sit here
+        // holding memory. The timer is cancelled on the first frame, which is
+        // always `register` in practice.
+        final registerTimer = Timer(
+          const Duration(milliseconds: AppConstants.registrationTimeoutMs),
+          () {
+            if (_clientUsers.containsKey(socket)) return;
+            _errorController.add('Dropped a connection that never registered.');
+            _removeClient(socket);
+          },
+        );
         socket.listen(
-          (data) => _handleClientMessage(socket, data),
-          onDone: () => _removeClient(socket),
+          (data) {
+            registerTimer.cancel();
+            _handleClientMessage(socket, data);
+          },
+          onDone: () {
+            registerTimer.cancel();
+            _removeClient(socket);
+          },
           onError: (Object e) {
+            registerTimer.cancel();
             _errorController.add('Client error: $e');
             _removeClient(socket);
           },
@@ -368,7 +405,10 @@ class HostService implements WebSocketService {
 
   User get _hostUser => User(
         id: hostUserId,
-        username: _roomName,
+        // Deliberately not the room name: in the user list the host appears
+        // alongside clients, and showing "Site Crew" there read as a person
+        // called Site Crew rather than the device running the room.
+        username: 'Host ($_roomName)',
         isHost: true,
         isMicOn: _hostMicOn,
         isSpeaking: _hostSpeaking,
@@ -459,11 +499,14 @@ class HostService implements WebSocketService {
   void _handlePrivateCallEnd(WebSocket socket) {
     final user = _clientUsers[socket];
     if (user == null) return;
-    _endPrivateCallFrom(user.id);
+    // Tell the caller too. `_endPrivateCallFrom` only notifies the partner,
+    // so a client that hangs up heard nothing at all and its UI stayed
+    // showing an active call until some other event refreshed it.
+    _endPrivateCallFrom(user.id, notifySelf: true);
   }
 
   /// Ends the active private call on behalf of [userId] (client or host).
-  void _endPrivateCallFrom(String userId) {
+  void _endPrivateCallFrom(String userId, {bool notifySelf = false}) {
     final partnerId = _privateCallPartnerOf(userId);
     if (partnerId == null) return;
     if (partnerId == hostUserId) {
@@ -473,6 +516,12 @@ class HostService implements WebSocketService {
       final partnerSocket = _usersById[partnerId];
       if (partnerSocket != null) {
         _sendTo(partnerSocket, const WsMessage(type: 'private_call_ended'));
+      }
+    }
+    if (notifySelf && userId != hostUserId) {
+      final selfSocket = _usersById[userId];
+      if (selfSocket != null) {
+        _sendTo(selfSocket, const WsMessage(type: 'private_call_ended'));
       }
     }
     _clearPrivateCall();
@@ -848,12 +897,22 @@ class HostService implements WebSocketService {
       await _server?.close(force: true);
     } catch (_) {}
     _server = null;
-    _isRunningController.add(false);
-    _connectionStatusController.add(ConnectionStatus.disconnected);
+    // `dispose()` may already have closed these. `stop()` and `dispose()` are
+    // called in both orders (teardown in tests, and _teardownServices on the
+    // app side), so neither may assume the other ran last.
+    if (!_disposed) {
+      _isRunningController.add(false);
+      _connectionStatusController.add(ConnectionStatus.disconnected);
+    }
   }
 
-  /// Releases the stream controllers. Called when the controller is disposed.
+  bool _disposed = false;
+
+  /// Releases the stream controllers. Safe to call more than once and safe to
+  /// call before or after [stop].
   void dispose() {
+    if (_disposed) return;
+    _disposed = true;
     _heartbeatTimer?.cancel();
     _heartbeatTimer = null;
     _speakingBroadcastTimer?.cancel();
