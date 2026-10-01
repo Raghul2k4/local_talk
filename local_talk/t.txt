@@ -1,0 +1,72 @@
+﻿00:00 +0: loading C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart
+00:00 +0: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: registers and is told its identity
+00:00 +1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: sees the host in the user list
+00:00 +2: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: wrong PIN is rejected with a friendly error
+00:00 +2 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: wrong PIN is rejected with a friendly error [E]
+  Expected: throws <Instance of 'JoinException'> with `message`: contains 'Invalid PIN'
+    Actual: <Instance of 'Future<String>'>
+     Which: emitted 'accc3cc9-a69c-442e-b729-261e91d1d4d4'
+  
+  package:matcher                                    expectLater
+  package:flutter_test/src/widget_tester.dart 507:8  expectLater
+  test\client_service_test.dart 91:11                main.<fn>
+  ===== asynchronous gap ===========================
+  dart:async                                         _CustomZone.registerUnaryCallback
+  test\client_service_test.dart 74:20                main.<fn>
+  
+00:00 +2 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: joinChannel validates and remembers the channel
+00:00 +3 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: receives audio sent by another client on the same channel
+00:00 +4 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: does NOT receive audio from a different channel
+00:01 +5 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +6 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +7 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +8 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +9 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +10 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +11 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +12 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +13 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +14 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +15 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +16 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +17 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +18 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +19 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +20 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +21 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +22 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +23 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +24 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:02 +25 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:03 +26 -1: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client
+00:04 +26 -2: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: private call lifecycle reaches the real client [E]
+  TimeoutException after 0:00:03.000000: Future not completed
+  dart:async  _startMicrotaskLoop
+  
+00:04 +26 -2: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: stop() tears the client down cleanly
+00:04 +27 -2: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: reconnect restores the channel after the socket drops
+00:11 +27 -3: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: reconnect restores the channel after the socket drops [E]
+  Expected: 'team-a'
+    Actual: <null>
+     Which: not an <Instance of 'String'>
+  reconnect must restore the channel the client was on
+  
+  package:matcher                                     expect
+  package:flutter_test/src/widget_tester.dart 473:18  expect
+  test\client_service_test.dart 199:7                 main.<fn>.<fn>
+  
+00:11 +27 -3: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: reconnect gives up and reports connection_lost
+00:41 +27 -4: C:/projects/TechLoft/local_com/local_talk/test/client_service_test.dart: reconnect gives up and reports connection_lost [E]
+  TimeoutException after 0:00:30.000000: Test timed out after 30 seconds. See https://pub.dev/packages/test#timeouts
+  dart:isolate  _RawReceivePort._handleMessage
+  
+  client never reported connection_lost
+  package:matcher                       fail
+  test\client_service_test.dart 218:26  main.<fn>.<fn>.<fn>
+  ===== asynchronous gap ===========================
+  dart:async                            Future.timeout
+  test\client_service_test.dart 216:18  main.<fn>.<fn>
+  ===== asynchronous gap ===========================
+  dart:async                            _CustomZone.registerUnaryCallback
+  test\client_service_test.dart 207:22  main.<fn>.<fn>
+  

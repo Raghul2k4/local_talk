@@ -46,3 +46,9 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# Scratch files produced while running analysis/tests from the repo root
+analyze.txt
+test_out.txt
+coverage/lcov.info
+*.tmp
