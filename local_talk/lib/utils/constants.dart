@@ -10,6 +10,13 @@ class AppConstants {
 
   /// ~58 ms of PCM16 mono audio per network frame. Small enough for a snappy
   /// push-to-talk feel, big enough that WebSocket framing overhead stays low.
+  ///
+  /// This single value defines the capture chunk size
+  /// (`setSubscriptionDuration`), the playback drain tick
+  /// (`AudioService._drainJitterBuffer`) and the silence-frame size. They must
+  /// agree or the jitter buffer drifts: capture and playback at different rates
+  /// makes latency grow until frames are dropped, which is heard as lag and
+  /// crackle. Do not change it in one place only.
   static const int audioFrameMs = 58;
   static const int audioFrameBytes = audioSampleRate * 2 * audioFrameMs ~/ 1000;
   static const int audioBufferSize = 8192;
@@ -54,10 +61,7 @@ class AppConstants {
   /// How often to poll for the hotspot to come up after enabling it.
   static const int hotspotPollMs = 600;
 
-  /// Max audio frames buffered per client before the oldest is dropped.
-  /// Keeps a stalled client from growing the queue without bound.
-  static const int maxQueuedAudioFrames = 40;
-
+  /// Max clients in a room.
   static const int maxClients = 24;
 
   /// Hard cap on raw WebSocket sockets, registered or not. Leaves headroom

@@ -9,7 +9,7 @@ import '../controllers/intercom_controller.dart';
 import '../theme/app_theme.dart';
 import '../utils/ip_utils.dart';
 import '../utils/network_utils.dart';
-import 'intercom_screen.dart';
+import 'host_ready_screen.dart';
 
 class HostScreen extends StatefulWidget {
   const HostScreen({super.key});
@@ -149,10 +149,12 @@ class _HostScreenState extends State<HostScreen> {
 
     if (!mounted) return;
     setState(() => _starting = false);
-    if (controller.error == null) {
+    if (controller.setupStage == RoomSetupStage.ready) {
+      // Go to the QR screen, not straight into the room: the host's job now
+      // is to show the code, not to start talking.
       Navigator.pushReplacement(
         context,
-        MaterialPageRoute(builder: (_) => const IntercomScreen()),
+        MaterialPageRoute(builder: (_) => const HostReadyScreen()),
       );
     }
   }
@@ -409,11 +411,103 @@ class _HostScreenState extends State<HostScreen> {
               ),
               if (context.watch<IntercomController>().error != null) ...[
                 const SizedBox(height: 16),
-                _ErrorCard(message: context.read<IntercomController>().error!),
+                // When the OS refused to let us start a hotspot, say exactly
+                // that and offer the settings trip. Pretending the app can
+                // toggle a system switch would be worse than an honest
+                // instruction.
+                if (context.watch<IntercomController>().hotspotNeedsUserAction)
+                  _HotspotGuidanceCard(
+                      message:
+                          context.read<IntercomController>().error!)
+                else
+                  _ErrorCard(
+                      message: context.read<IntercomController>().error!),
               ],
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// Shown when the OS blocked a programmatic hotspot.
+///
+/// Android 10+ removed `WifiManager.setWifiApEnabled` for third-party apps, so
+/// this is a normal outcome rather than a failure to work around. The card
+/// tells the user what to do and hands them the settings screen; it does not
+/// claim LocalTalk can do it for them.
+class _HotspotGuidanceCard extends StatelessWidget {
+  final String message;
+
+  const _HotspotGuidanceCard({required this.message});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: AppTheme.surface,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: AppTheme.primary.withValues(alpha: 0.5),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.wifi_tethering_rounded, color: AppTheme.primary),
+              SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  'Local network required',
+                  style: TextStyle(
+                    color: AppTheme.textPrimary,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Text(
+            message,
+            style: const TextStyle(
+              color: AppTheme.textSecondary,
+              fontSize: 13,
+              height: 1.4,
+            ),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            message.contains('Wi-Fi')
+                ? 'Connect to Wi-Fi instead — the room works the same way.'
+                : 'After turning it on, come back and start the room again.',
+            style: const TextStyle(
+              color: AppTheme.textSecondary,
+              fontSize: 12,
+            ),
+          ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: () => openAppSettings(),
+                  icon: const Icon(Icons.settings_rounded, size: 18),
+                  label: const Text('Open settings'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: AppTheme.textPrimary,
+                    side: const BorderSide(color: AppTheme.outline),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }

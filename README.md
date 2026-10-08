@@ -180,8 +180,13 @@ Flutter app under `local_talk/`. Entry point: `lib/main.dart` -> `IntercomContro
 - **Liveness:** `_lastSeen` is refreshed by any inbound frame; the heartbeat sweep evicts
   clients silent for `AppConstants.clientTimeoutMs`. Without this, sleeping or force-killed
   phones linger in the room.
-- **Backpressure:** `_enqueueAudio` tracks unacknowledged frames per socket and drops for
-  clients that fall too far behind (reset on each heartbeat).
+- **Backpressure:** `_enqueueAudio` tracks outstanding frames per socket and **refuses** new
+  ones once a client is more than `_maxPendingFrames` (~1.4 s) behind. `dart:io` exposes no
+  socket-buffer size, so the count is *aged out in real time* (`_decayedPending`) rather than
+  reset on the heartbeat — a heartbeat-only counter would read ~170 frames for a perfectly
+  healthy client and discard good audio. Refusing the frame is the only real backpressure
+  available; incrementing a counter while still calling `client.add()` just grows the heap
+  until the OS kills the process.
 - Clients reconnect up to `maxReconnectAttempts`; **`ClientService._currentChannelId` is
   re-sent on reconnect** — the host would otherwise treat the device as channel-less and
   leak the whole room to it.
@@ -196,6 +201,12 @@ Flutter app under `local_talk/`. Entry point: `lib/main.dart` -> `IntercomContro
 that pre-rolls `jitterPrimedFrames` and then feeds one frame per `audioFrameMs`, dropping the
 oldest beyond `jitterMaxFrames`, so network jitter is not audible. `feedAudioData` is
 synchronous and must never block the network read loop.
+
+`AppConstants.audioFrameMs` is the single source of truth for the frame period: it sets the
+capture chunk (`setSubscriptionDuration`), the drain tick **and** `audioFrameBytes`. If
+capture and playback run at different rates the jitter buffer fills faster than it drains,
+latency grows until every incoming frame is dropped, and the symptom is lag and crackle with
+no error anywhere. Keep the three in step.
 
 Bandwidth is roughly 256 kbit/s per transmitting device — see the roadmap for the Opus fix.
 

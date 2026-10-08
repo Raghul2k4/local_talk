@@ -25,6 +25,8 @@
 	<key>CFBundleVersion</key>
 	<string>$(FLUTTER_BUILD_NUMBER)</string>  <key>LSRequiresIPhoneOS</key>
   <true/>
+  <key>NSCameraUsageDescription</key>
+  <string>LocalTalk uses the camera only to scan the host's QR code so you can join a room without typing an address.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>LocalTalk needs microphone access so you can talk with others in your intercom room.</string>
   <key>NSLocalNetworkUsageDescription</key>

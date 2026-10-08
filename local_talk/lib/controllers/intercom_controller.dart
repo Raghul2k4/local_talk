@@ -5,16 +5,34 @@ import 'package:flutter/foundation.dart';
 import '../data/app_data.dart';
 import '../models/channel.dart';
 import '../models/message.dart';
+import '../models/room_invite.dart';
 import '../models/user.dart';
 import '../services/audio_service.dart';
 import '../services/client_service.dart';
 import '../services/host_service.dart';
 import '../services/hotspot_service.dart';
+import '../services/mic_permission_service.dart';
 import '../services/session_keeper.dart';
 import '../services/websocket_service.dart';
 import '../utils/constants.dart';
+import '../utils/ip_utils.dart';
 
 enum IntercomRole { none, host, client }
+
+/// Ordered stages of bringing a room up, surfaced verbatim in the UI.
+///
+/// The brief asks for named states rather than a spinner; having them as an
+/// enum keeps the wording in one place and makes it impossible to skip or
+/// reorder a step without editing the screen too.
+enum RoomSetupStage {
+  none,
+  checkingNetwork,
+  preparingNetwork,
+  startingServer,
+  findingAddress,
+  ready,
+  failed,
+}
 
 /// Incoming private-call ring state.
 class IncomingCall {
@@ -64,8 +82,44 @@ class IntercomController extends ChangeNotifier {
   IncomingCall? _incomingCall;
 
   AppData? _appData;
+  final MicPermissionService _micPermission = const MicPermissionService();
+
+  RoomSetupStage _setupStage = RoomSetupStage.none;
+  MicPermissionStatus _micStatus = MicPermissionStatus.granted;
+  bool _hotspotNeedsUserAction = false;
+
+  /// Last invite payload published by the host, for the QR panel.
+  RoomInvite? _invite;
 
   IntercomRole get role => _role;
+  RoomSetupStage get setupStage => _setupStage;
+  MicPermissionStatus get micStatus => _micStatus;
+  String? get micMessage => _micStatus == MicPermissionStatus.granted
+      ? null
+      : MicPermissionService.messageFor(_micStatus);
+
+  /// True when the OS blocked a programmatic hotspot and the user has to turn
+  /// it on from system settings. Drives the guidance screen.
+  bool get hotspotNeedsUserAction => _hotspotNeedsUserAction;
+
+  /// The QR payload for the room currently hosted.
+  RoomInvite? get invite => _invite;
+
+  /// The verified address guests should use, or null when it could not be
+  /// determined.
+  HostAddress? get advertisedAddress => _hostService?.advertisedAddress;
+
+  /// The port the host actually bound.
+  int? get hostPort => _hostService?.boundPort;
+
+  /// `ip:port` for the manual fallback, or null when unknown.
+  String? get connectionEndpoint {
+    final address = advertisedAddress;
+    final port = hostPort;
+    if (address == null || port == null) return null;
+    return '${address.ip}:$port';
+  }
+
   List<User> get users => List.unmodifiable(_users);
   String? get error => _error;
   bool get isHost => _role == IntercomRole.host;
@@ -116,14 +170,58 @@ class IntercomController extends ChangeNotifier {
 
   Future<void> initialize({AppData? appData}) async {
     _appData = appData;
-    _audioService = AudioService();
+
+    // Ask for the microphone *before* touching audio. The old flow called
+    // `AudioService.initialize()` first, let it throw for want of permission,
+    // and swallowed the failure — which is why users met "Microphone is not
+    // available" only after pressing the mic button.
+    await ensureMicPermission(requestIfNeeded: true);
+
+    if (_micStatus == MicPermissionStatus.granted) {
+      await _initAudio();
+    }
+    // Otherwise audio stays uninitialised and every entry point re-checks the
+    // permission first. The app is still fully usable for listening.
+  }
+
+  /// Creates and initialises the audio stack, recording any user-facing
+  /// failure on [error] rather than throwing it at the caller.
+  Future<void> _initAudio() async {
+    final audio = AudioService();
     try {
-      await _audioService!.initialize();
-    } on AudioInitException {
-      // Mic may not be granted yet; retry lazily on first PTT press.
-      _audioService = AudioService();
+      await audio.initialize();
+      _audioService = audio;
+    } on AudioInitException catch (e) {
+      _audioService = null;
+      _error = e.message;
+    } catch (_) {
+      _audioService = null;
+      _error = 'Could not set up audio. Restart the app, and check that '
+          'LocalTalk is allowed to use the microphone.';
     }
   }
+
+  /// Checks — and optionally requests — microphone access.
+  ///
+  /// Safe to call repeatedly; returns the resulting status. The only caller
+  /// that should prompt is one the user just triggered (app launch, creating a
+  /// room, first PTT press).
+  Future<MicPermissionStatus> ensureMicPermission({
+    required bool requestIfNeeded,
+  }) async {
+    final status = requestIfNeeded
+        ? await _micPermission.request()
+        : await _micPermission.check();
+    if (status != _micStatus) {
+      _micStatus = status;
+      notifyListeners();
+    }
+    return status;
+  }
+
+  /// Whether the user must visit system settings before we can retry.
+  bool get micNeedsSettings =>
+      MicPermissionService.requiresSettings(_micStatus);
 
   AppData? get appData => _appData;
 
@@ -136,19 +234,26 @@ class IntercomController extends ChangeNotifier {
 
   /// Creates a fresh [AudioService], e.g. after mic permission was granted.
   Future<bool> recreateAudioService() async {
-    try {
-      final old = _audioService;
-      final audio = AudioService();
-      await audio.initialize();
-      _audioService = audio;
-      try {
-        await old?.dispose();
-      } catch (_) {}
+    final status = await ensureMicPermission(requestIfNeeded: true);
+    if (status != MicPermissionStatus.granted) {
+      _error = MicPermissionService.messageFor(status);
       notifyListeners();
-      return true;
-    } on AudioInitException {
       return false;
     }
+    final previous = _audioService;
+    _audioService = null;
+    await _initAudio();
+    if (_audioService == null) {
+      try {
+        await previous?.dispose();
+      } catch (_) {}
+      return false;
+    }
+    try {
+      await previous?.dispose();
+    } catch (_) {}
+    notifyListeners();
+    return true;
   }
 
   // ------------------------------------------------------------ host mode
@@ -162,9 +267,12 @@ class IntercomController extends ChangeNotifier {
     _error = null;
     _isConnecting = true;
     _connectionStatus = ConnectionStatus.connecting;
+    _setupStage = RoomSetupStage.checkingNetwork;
     notifyListeners();
 
     if (useHotspot) {
+      _setupStage = RoomSetupStage.preparingNetwork;
+      _hotspotNeedsUserAction = false;
       _hotspotService = HotspotService();
       _hotspotService!.statusStream.listen((active) {
         _isHotspotActive = active;
@@ -180,13 +288,16 @@ class IntercomController extends ChangeNotifier {
         password: hotspotPassword,
       );
       if (!hotspotStarted) {
-        _error = _hotspotService == null
-            ? 'Could not start hotspot. Try again or use Wi-Fi.'
-            : 'Hotspot failed. Try again or use Wi-Fi.';
+        // Android 10+ blocks apps from enabling a hotspot, so this is an
+        // expected outcome rather than a bug. Flag it for the guidance
+        // screen instead of dead-ending on a generic error.
+        _hotspotNeedsUserAction = true;
+        _error = _hotspotService?.lastError ??
+            'This device will not let LocalTalk turn on a hotspot. Turn it on '
+                'from your quick settings, then try again.';
         _connectionStatus = ConnectionStatus.disconnected;
         _isConnecting = false;
-        _hotspotService = null;
-        _isHotspotActive = false;
+        _setupStage = RoomSetupStage.failed;
         notifyListeners();
         return;
       }
@@ -197,6 +308,7 @@ class IntercomController extends ChangeNotifier {
     }
 
     final host = HostService(roomName: roomName, pin: pin);
+    host.hotspotExpected = _isHotspotActive;
     _hostService = host;
     _role = IntercomRole.host;
     _listenToCommonStreams(host, isHost: true);
@@ -207,18 +319,49 @@ class IntercomController extends ChangeNotifier {
     });
 
     try {
+      _setupStage = RoomSetupStage.startingServer;
+      notifyListeners();
       await host.start();
+
+      // Detect/verify the address *before* announcing readiness. A room that
+      // reports ready with an unreachable address is the original bug, and it
+      // is worse than an explicit failure because the guest fails instead.
+      _setupStage = RoomSetupStage.findingAddress;
+      notifyListeners();
+      final addressError = host.addressError;
+      if (addressError != null) {
+        _error = addressError;
+        _connectionStatus = ConnectionStatus.disconnected;
+        _setupStage = RoomSetupStage.failed;
+        await _teardownServices();
+        notifyListeners();
+        return;
+      }
+      _invite = host.invite;
+      if (_invite == null) {
+        _error =
+            'The room started, but its address could not be shared. Check your '
+            'Wi-Fi and start the room again.';
+        _connectionStatus = ConnectionStatus.disconnected;
+        _setupStage = RoomSetupStage.failed;
+        await _teardownServices();
+        notifyListeners();
+        return;
+      }
+
       // Keep the session alive: screen on, foreground service, audio focus.
       // Without this, backgrounding the app can suspend the process and the
       // room dies for everyone.
       await _sessionKeeper.start();
       await _audioService?.startPlayback();
       _connectionStatus = ConnectionStatus.connected;
+      _setupStage = RoomSetupStage.ready;
     } catch (e) {
       _error = 'Could not start the room.\n'
           'Another app may be using port ${_portForError(e)}. '
           'Try restarting the app.';
       _connectionStatus = ConnectionStatus.disconnected;
+      _setupStage = RoomSetupStage.failed;
       await _teardownServices();
     } finally {
       _isConnecting = false;
@@ -237,7 +380,18 @@ class IntercomController extends ChangeNotifier {
   // ----------------------------------------------------------- client mode
 
   /// Throws [JoinException] with a friendly message when joining fails.
-  Future<void> joinRoom(String hostIp, String username, {String? pin}) async {
+  ///
+  /// [invite] is the scanned QR payload. When present its address, port and
+  /// room credentials are used verbatim — the guest never derives or guesses an
+  /// endpoint, which is the whole point of the QR flow. Omitting it is the
+  /// advanced/manual fallback.
+  Future<void> joinRoom(
+    String hostIp,
+    String username, {
+    String? pin,
+    RoomInvite? invite,
+    int? port,
+  }) async {
     if (_isConnecting || _role != IntercomRole.none) return;
     _error = null;
     _isConnecting = true;
@@ -252,7 +406,26 @@ class IntercomController extends ChangeNotifier {
       await _appData?.setLastPin(pin);
     }
 
-    final client = ClientService(hostIp: hostIp, username: username, pin: pin);
+    // An invite wins over anything typed by hand: it is the address the host
+    // itself verified as reachable.
+    final targetIp = invite?.ip ?? hostIp.trim();
+    final targetPort = invite?.port ?? port ?? AppConstants.wsPort;
+    if (targetIp.isEmpty) {
+      _isConnecting = false;
+      throw JoinException(
+        'No host address was provided. Scan the QR code on the host screen, '
+        'or enter the address manually.',
+      );
+    }
+
+    final client = ClientService(
+      hostIp: targetIp,
+      username: username,
+      pin: pin,
+      port: targetPort,
+      roomId: invite?.roomId,
+      roomToken: invite?.token,
+    );
     _clientService = client;
     _role = IntercomRole.client;
     _listenToCommonStreams(client, isHost: false);
@@ -398,15 +571,21 @@ class IntercomController extends ChangeNotifier {
   /// Begins transmitting. Safe to call repeatedly.
   Future<bool> startTalking() async {
     if (_role == IntercomRole.none || _isMicOn) return _isMicOn;
+
+    // Re-check before every first press. The permission can have been revoked
+    // in system settings while the room was open, and the mic may still be
+    // held by another app.
     var audio = _audioService;
     if (audio == null || !audio.isReady) {
-      // Lazy retry (e.g. mic permission granted after startup failure).
-      audio = AudioService();
-      try {
-        await audio.initialize();
-        _audioService = audio;
-      } on AudioInitException {
-        _error = 'Microphone is not available. Check app permissions.';
+      final status = await ensureMicPermission(requestIfNeeded: true);
+      if (status != MicPermissionStatus.granted) {
+        _error = MicPermissionService.messageFor(status);
+        notifyListeners();
+        return false;
+      }
+      await _initAudio();
+      audio = _audioService;
+      if (audio == null || !audio.isReady) {
         notifyListeners();
         return false;
       }
@@ -555,22 +734,64 @@ class IntercomController extends ChangeNotifier {
 
   // ------------------------------------------------------------------ leaving
 
+  /// Guards against a second leave running while the first is still awaiting.
+  ///
+  /// Leave is reachable from the app bar *and* the back button, and a double
+  /// tap is easy. Without this, two overlapping teardowns both reach
+  /// `_teardownServices`, and the loser's `dispose()` runs against services the
+  /// winner already nulled — which surfaces as a leave that "sometimes" does
+  /// nothing.
+  bool _isLeaving = false;
+
+  /// Leaves the room and returns the device to a clean, re-joinable state.
+  ///
+  /// Every teardown step is guarded individually. This runs on the user's way
+  /// out of a working call, so a single failing plugin must never strand them
+  /// in the room: if `stopRecording` or `stopPlayer` throws, the host server
+  /// still has to be closed and the local state still has to be reset.
   Future<void> leaveRoom() async {
-    await stopTalking();
-    await _audioService?.stopPlayback();
-    await _teardownServices();
-    _role = IntercomRole.none;
-    _users.clear();
-    _connectionStatus = ConnectionStatus.disconnected;
-    _roomInfo = null;
-    _currentChannelId = null;
-    _isInPrivateCall = false;
-    _privateCallPartnerId = null;
-    _privateCallPartnerName = null;
-    _incomingCall = null;
-    _packetsSent = 0;
-    _packetsReceived = 0;
-    notifyListeners();
+    if (_isLeaving) return;
+    _isLeaving = true;
+    try {
+      // Stop transmitting first so the room stops receiving our audio before
+      // the socket goes away.
+      try {
+        await stopTalking();
+      } catch (_) {}
+
+      try {
+        await _audioService?.stopPlayback();
+      } catch (_) {}
+
+      // Never skipped: this is what actually closes the host server and
+      // releases the wakelock/foreground service.
+      await _teardownServices();
+
+      _role = IntercomRole.none;
+      _users.clear();
+      _connectionStatus = ConnectionStatus.disconnected;
+      _roomInfo = null;
+      _currentChannelId = null;
+      _isInPrivateCall = false;
+      _privateCallPartnerId = null;
+      _privateCallPartnerName = null;
+      _incomingCall = null;
+      _packetsSent = 0;
+      _packetsReceived = 0;
+
+      // Without these the device is not actually re-joinable. `joinRoom`
+      // early-returns while `_isConnecting` is set, and `HostScreen` reads
+      // `_setupStage` to decide whether the room came up — so a stale `ready`
+      // or a stuck `true` makes the *next* attempt silently do nothing.
+      _isConnecting = false;
+      _setupStage = RoomSetupStage.none;
+      _hotspotNeedsUserAction = false;
+      _invite = null;
+      _error = null;
+      notifyListeners();
+    } finally {
+      _isLeaving = false;
+    }
   }
 
   Future<void> _teardownServices() async {
@@ -590,9 +811,13 @@ class IntercomController extends ChangeNotifier {
     _clientService?.dispose();
     _hostService = null;
     _clientService = null;
-    if (_hotspotService?.isActive == true) {
-      await _hotspotService?.stopHotspot();
-    }
+    // Guarded like the rest: a hotspot that refuses to stop must not leave the
+    // device stuck in a room it already left, with `_hotspotService` non-null.
+    try {
+      if (_hotspotService?.isActive == true) {
+        await _hotspotService?.stopHotspot();
+      }
+    } catch (_) {}
     _hotspotService = null;
     _hotspotSsid = null;
     _hotspotPassword = null;

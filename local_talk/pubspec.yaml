@@ -23,6 +23,8 @@ dependencies:
   wakelock_plus: ^1.8.0
   audio_session: ^0.2.4
   flutter_foreground_task: ^11.0.3
+  qr_flutter: ^4.1.0
+  mobile_scanner: ^7.0.0
 
 dev_dependencies:
   flutter_test:

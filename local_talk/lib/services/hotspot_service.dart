@@ -5,12 +5,14 @@ import 'package:flutter/services.dart';
 import 'package:wifi_iot/wifi_iot.dart';
 
 import '../utils/constants.dart';
+import '../utils/ip_utils.dart';
 
 class HotspotService {
   bool _isActive = false;
   String? _ssid;
   String? _password;
   String? _ipAddress;
+  String? _lastError;
 
   final StreamController<bool> _statusController =
       StreamController<bool>.broadcast();
@@ -25,9 +27,25 @@ class HotspotService {
   String? get password => _password;
   String? get ipAddress => _ipAddress;
 
+  /// The most recent failure, in user-facing words.
+  ///
+  /// Exposed so the controller can show something specific instead of a
+  /// generic "hotspot failed", which is what the caller used to receive.
+  String? get lastError => _lastError;
+
+  /// Records a failure both on the stream and for [lastError].
+  void _fail(String message) {
+    _lastError = message;
+    _errorController.add(message);
+  }
+
   Future<bool> startHotspot({String? ssid, String? password}) async {
+    _lastError = null;
     if (!Platform.isAndroid) {
-      _errorController.add('Hotspot is only supported on Android.');
+      _fail(
+        'Hotspots can only be started on Android. Connect both phones to the '
+        'same Wi-Fi network instead.',
+      );
       return false;
     }
 
@@ -41,8 +59,11 @@ class HotspotService {
 
       final enabled = await WiFiForIoTPlugin.setWiFiAPEnabled(true);
       if (!enabled) {
-        _errorController
-            .add('Could not enable hotspot. Try again or use Wi-Fi.');
+        _fail(
+          'Android would not let LocalTalk turn on a hotspot. Turn it on from '
+          'your quick settings, then start the room again. Using Wi-Fi works '
+          'the same way.',
+        );
         return false;
       }
 
@@ -57,9 +78,10 @@ class HotspotService {
       }
 
       if (!hotspotReady) {
-        _errorController.add(
-          'The hotspot did not come up within a few seconds. Try again, or '
-          'use Wi-Fi — the room works the same way on either.',
+        _fail(
+          'The hotspot did not come up within a few seconds. Turn it on '
+          'manually from your quick settings, or use Wi-Fi — the room works '
+          'the same way on either.',
         );
         try {
           await WiFiForIoTPlugin.setWiFiAPEnabled(false);
@@ -85,15 +107,16 @@ class HotspotService {
       _statusController.add(true);
       return true;
     } on PlatformException catch (e) {
-      _errorController.add(_describe(e));
+      _fail(_describe(e));
       return false;
     } catch (e) {
       // Never surface a raw exception: `PlatformException.toString()` includes
       // the full Java stack trace, which is unreadable in the UI and tells the
       // user nothing actionable.
-      _errorController.add(
+      _fail(
         'Could not start the hotspot. Some Android versions block this — '
-        'connecting to Wi-Fi and using that network instead works either way.',
+        'turn it on from your quick settings, or connect to Wi-Fi and use '
+        'that network instead. Either works the same way.',
       );
       return false;
     }
@@ -133,36 +156,16 @@ class HotspotService {
     _statusController.add(false);
   }
 
+  /// The address guests should reach us on once the hotspot is up.
+  ///
+  /// Delegates to [IpUtils] rather than sniffing for `192.168.43.`-style
+  /// prefixes: a hardcoded prefix list is wrong on any device whose hotspot
+  /// hands out a different range, and it could not tell a hotspot address from
+  /// a VPN one. The selector scores interfaces instead, so it works whatever
+  /// subnet the OS picked.
   Future<String?> _detectHotspotIp() async {
-    try {
-      final interfaces = await NetworkInterface.list(
-        includeLoopback: false,
-        type: InternetAddressType.IPv4,
-      );
-
-      for (final interface in interfaces) {
-        final name = interface.name.toLowerCase();
-        if (name.startsWith('ap') || name.startsWith('wlan')) {
-          for (final addr in interface.addresses) {
-            final ip = addr.address;
-            if (!ip.startsWith('127.') && !ip.startsWith('169.254.')) {
-              return ip;
-            }
-          }
-        }
-      }
-
-      const hotspotPrefixes = ['192.168.43.', '192.168.137.', '192.168.1.'];
-      for (final interface in interfaces) {
-        for (final addr in interface.addresses) {
-          final ip = addr.address;
-          if (hotspotPrefixes.any(ip.startsWith)) {
-            return ip;
-          }
-        }
-      }
-    } catch (_) {}
-    return null;
+    final address = await IpUtils.detectHostAddress(hotspotActive: true);
+    return address?.ip;
   }
 
   String _generatePassword() {

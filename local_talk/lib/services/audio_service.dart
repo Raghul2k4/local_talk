@@ -41,19 +41,72 @@ class AudioService {
   double get lastLevel => _lastLevel;
 
   Future<void> initialize() async {
+    _recorder ??= FlutterSoundRecorder();
+    _player ??= FlutterSoundPlayer();
     try {
-      _recorder ??= FlutterSoundRecorder();
-      _player ??= FlutterSoundPlayer();
       await _recorder!.openRecorder();
+      // MUST match the playback tick in [_drainJitterBuffer] (AppConstants
+      // .audioFrameMs). These were previously 50 ms and 58 ms, so capture
+      // produced 20 frames/s while the drain timer consumed 17.2 frames/s. The
+      // jitter buffer therefore grew without bound until it hit its ceiling
+      // and then dropped the oldest frame on every single arrival - audible as
+      // growing lag, then gaps and clipped syllables for the whole
+      // transmission. Any mismatch here shows up as lag, not as an error.
       await _recorder!.setSubscriptionDuration(
-        const Duration(milliseconds: 50),
+        const Duration(milliseconds: AppConstants.audioFrameMs),
       );
       _recorderReady = true;
+    } on AudioInitException {
+      rethrow;
+    } catch (e) {
+      throw AudioInitException(
+        'Could not open the microphone. '
+        '${_explain(e)}',
+        MicFailure.unavailable,
+      );
+    }
+    try {
       await _player!.openPlayer();
       _playerReady = true;
     } catch (e) {
-      throw AudioInitException('Microphone/audio init failed: $e');
+      // Listening is still possible without a player on some devices, but
+      // say what actually failed rather than reporting a mic problem.
+      _playerReady = false;
+      throw AudioInitException(
+        'Could not start audio playback. ${_explain(e)}',
+        MicFailure.playback,
+      );
     }
+  }
+
+  /// Maps a platform error onto a plain sentence.
+  ///
+  /// `flutter_sound` surfaces `PlatformException`s whose `code` is the only
+  /// reliable signal; the `message` is usually a raw Java stack fragment that
+  /// means nothing to a user.
+  static String _explain(Object e) {
+    final text = e.toString().toLowerCase();
+
+    if (text.contains('in_use') ||
+        text.contains('already in use') ||
+        text.contains('audio recorder error') ||
+        text.contains('mic busy')) {
+      return 'Another app is using the microphone right now. Close it and try '
+          'again.';
+    }
+    if (text.contains('permission') ||
+        text.contains('securityexception') ||
+        text.contains('denied')) {
+      return 'Microphone permission was not granted. Enable it for LocalTalk '
+          'in Settings.';
+    }
+    if (text.contains('no microphone') ||
+        text.contains('not available') ||
+        text.contains('nodriver')) {
+      return 'No microphone was found on this device.';
+    }
+    return 'Something went wrong while setting up audio. Try again, and '
+        'restart the app if it keeps happening.';
   }
 
   /// Records live PCM16 frames onto [audioStream].
@@ -205,9 +258,31 @@ class AudioService {
   }
 }
 
+/// Why audio setup failed.
+///
+/// Carried as an enum rather than inferred from the message so callers can
+/// branch (offer Settings, disable the mic button, keep playback running)
+/// without string-matching, which is how vague errors tend to grow.
+enum MicFailure {
+  /// The recorder could not be opened.
+  unavailable,
+
+  /// The recorder is fine but the player could not start.
+  playback,
+
+  /// The platform refused for a reason worth sending the user to Settings.
+  permission,
+}
+
+/// Audio failed to initialise, with a message safe to show a user.
+///
+/// The message is never a raw exception: the old version interpolated `$e`,
+/// which on Android meant dumping a Java stack trace into the UI.
 class AudioInitException implements Exception {
   final String message;
-  AudioInitException(this.message);
+  final MicFailure reason;
+
+  const AudioInitException(this.message, this.reason);
 
   @override
   String toString() => message;

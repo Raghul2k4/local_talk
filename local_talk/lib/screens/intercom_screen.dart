@@ -76,42 +76,63 @@ class _IntercomScreenState extends State<IntercomScreen> {
     return buffer.toString();
   }
 
-  Future<void> _confirmLeave() async {
-    final leave = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Leave the room?'),
-        content: Text(
-          context.read<IntercomController>().isHost
-              ? 'Everyone connected will be disconnected.'
-              : 'You will stop hearing the conversation.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Stay'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: FilledButton.styleFrom(
-              backgroundColor: AppTheme.danger,
-              foregroundColor: Colors.white,
-            ),
-            child: const Text('Leave'),
-          ),
-        ],
-      ),
-    );
-    if (leave != true || !mounted) return;
+  /// Set while the leave confirmation is on screen or being acted on.
+  ///
+  /// Without it a double tap on Leave stacks two dialogs and runs `leaveRoom`
+  /// twice, and the back button can fire `_confirmLeave` again while the first
+  /// is still awaiting — the classic "sometimes it leaves, sometimes it
+  /// doesn't".
+  bool _leaving = false;
 
-    final controller = context.read<IntercomController>();
-    await controller.leaveRoom();
-    if (!mounted) return;
-    Navigator.pushAndRemoveUntil(
-      context,
-      MaterialPageRoute(builder: (_) => const HomeScreen()),
-      (route) => false,
-    );
+  Future<void> _confirmLeave() async {
+    if (_leaving) return;
+    _leaving = true;
+    try {
+      final leave = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Leave the room?'),
+          content: Text(
+            context.read<IntercomController>().isHost
+                ? 'Everyone connected will be disconnected.'
+                : 'You will stop hearing the conversation.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Stay'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              style: FilledButton.styleFrom(
+                backgroundColor: AppTheme.danger,
+                foregroundColor: Colors.white,
+              ),
+              child: const Text('Leave'),
+            ),
+          ],
+        ),
+      );
+      if (leave != true || !mounted) return;
+
+      final controller = context.read<IntercomController>();
+      try {
+        await controller.leaveRoom();
+      } catch (_) {
+        // Teardown already guards each step, but leaving the room must not be
+        // something a plugin error can veto — the user asked to go.
+      }
+      if (!mounted) return;
+      // pushAndRemoveUntil clears the whole stack, so this is the same
+      // "one Home, nothing behind it" result whichever way the user leaves.
+      Navigator.pushAndRemoveUntil(
+        context,
+        MaterialPageRoute(builder: (_) => const HomeScreen()),
+        (route) => false,
+      );
+    } finally {
+      _leaving = false;
+    }
   }
 
   Future<void> _showIncomingCall() async {

@@ -16,8 +16,21 @@ class ClientService implements WebSocketService {
   final String _hostIp;
   final String? _pin;
 
+  /// Room identity carried by the host's invite.
+  ///
+  /// Named `_inviteRoomId` rather than `_roomId` because the room id the host
+  /// *reports* after a successful join already lives in a field below; this is
+  /// the one we present to join with.
+  ///
+  /// Required by the host before it will register us. Null only on the legacy
+  /// manual path, which the host rejects with "room is no longer running" —
+  /// that is intentional: manual entry is a fallback, not a way in.
+  final String? _inviteRoomId;
+  final String? _inviteToken;
+
   /// Port the host listens on. Injectable so tests can point at an ephemeral
-  /// port instead of the real [AppConstants.wsPort].
+  /// port instead of the real [AppConstants.wsPort], and so a scanned QR can
+  /// carry whatever port the host actually bound.
   final int port;
 
   bool _stopped = false;
@@ -66,12 +79,18 @@ class ClientService implements WebSocketService {
     required String hostIp,
     required String username,
     String? pin,
+    String? roomId,
+    String? roomToken,
     this.port = AppConstants.wsPort,
   })  : _hostIp = hostIp.trim(),
         _username = username.trim().isEmpty
             ? AppConstants.defaultUsername
             : username.trim(),
-        _pin = (pin == null || pin.isEmpty) ? null : pin;
+        _pin = (pin == null || pin.isEmpty) ? null : pin,
+        _inviteRoomId = (roomId == null || roomId.isEmpty) ? null : roomId,
+        _inviteToken = (roomToken == null || roomToken.isEmpty)
+            ? null
+            : roomToken;
 
   @override
   Stream<List<User>> get usersStream => _usersController.stream;
@@ -121,6 +140,19 @@ class ClientService implements WebSocketService {
     _connectionStatus = status;
     _connectionStatusController.add(status);
   }
+
+  /// The `register` payload. Identical on first connect and on reconnect, so it
+  /// is built in one place — a reconnect that forgot the room token would be
+  /// rejected as "room no longer running".
+  WsMessage _registerMessage() => WsMessage(
+        type: 'register',
+        data: {
+          'username': _username,
+          if (_pin != null) 'pin': _pin,
+          if (_inviteRoomId != null) 'roomId': _inviteRoomId,
+          if (_inviteToken != null) 'token': _inviteToken,
+        },
+      );
 
   Uri _uri() => Uri.parse('ws://$_hostIp:$port');
 
@@ -196,10 +228,7 @@ class ClientService implements WebSocketService {
       }
     });
 
-    _sendJson(WsMessage(
-      type: 'register',
-      data: {'username': _username, if (_pin != null) 'pin': _pin},
-    ));
+    _sendJson(_registerMessage());
 
     // If the connection drops while waiting, fail fast.
     _connectionStatusController.stream.listen((status) {
@@ -308,7 +337,9 @@ class ClientService implements WebSocketService {
           _messageController.add(msg);
       }
     } else if (data is List<int>) {
-      _audioController.add(data);
+      // Same hazard as the host: a frame arriving after dispose() would throw
+      // on a closed controller and crash the app with no visible error.
+      if (!_disposed) _audioController.add(data);
     }
   }
 
@@ -426,10 +457,10 @@ class ClientService implements WebSocketService {
         onError: (Object e) => _onSocketLost('Connection error'),
         onDone: () => _onSocketLost('Disconnected from host'),
       );
-      _sendJson(WsMessage(
-        type: 'register',
-        data: {'username': _username, if (_pin != null) 'pin': _pin},
-      ));
+      // Re-register to get back into the room. Uses the same payload builder
+      // as the first connect, so the room token is never dropped on a
+      // reconnect — that would look like the room vanished.
+      _sendJson(_registerMessage());
       // Rejoin the channel we were on before the drop. Without this the host
       // treats us as channel-less and we would hear the whole room.
       final channelId = _currentChannelId;

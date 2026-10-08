@@ -57,10 +57,12 @@ void main() {
   late HostService host;
   late int port;
 
-  Future<HostService> startHost({int? onPort, String? pin}) async {
+  Future<HostService> startHost({int? onPort, String? pin, String? roomId, String? joinToken}) async {
     final service = HostService(
       roomName: 'Loopback',
       pin: pin,
+      roomId: roomId,
+      joinToken: joinToken,
       channels: const [
         Channel(id: 'general', name: 'General'),
         Channel(id: 'team-a', name: 'Team A'),
@@ -72,11 +74,14 @@ void main() {
   }
 
   Future<ClientService> join(String name, {String? pin, int? onPort}) async {
+    // Carries the host's room credentials, exactly as a scanned invite would.
     final client = ClientService(
       hostIp: '127.0.0.1',
       username: name,
       pin: pin,
       port: onPort ?? port,
+      roomId: host.roomId,
+      roomToken: host.joinToken,
     );
     addTearDown(() async {
       await client.stop();
@@ -112,6 +117,8 @@ void main() {
       hostIp: '127.0.0.1',
       username: 'Alice',
       port: port,
+      roomId: host.roomId,
+      roomToken: host.joinToken,
     );
     addTearDown(() async {
       await client.stop();
@@ -149,11 +156,14 @@ void main() {
       pinned.dispose();
     });
 
+    // Valid room credentials, wrong PIN: the rejection must be about the PIN.
     final client = ClientService(
       hostIp: '127.0.0.1',
       username: 'Mallory',
       pin: '9999',
       port: pinned.boundPort!,
+      roomId: pinned.roomId,
+      roomToken: pinned.joinToken,
     );
     addTearDown(() async {
       await client.stop();
@@ -308,7 +318,16 @@ void main() {
           .firstWhere((s) => s != ConnectionStatus.connected)
           .timeout(const Duration(seconds: 8));
 
-      host = await startHost(onPort: port);
+      // Restarted with the SAME room credentials, so this models "the host
+      // process bounced but the room is still the same one we scanned". A host
+      // with fresh credentials would (correctly) reject us as a stale invite.
+      final previousRoomId = host.roomId;
+      final previousToken = host.joinToken;
+      host = await startHost(
+        onPort: port,
+        roomId: previousRoomId,
+        joinToken: previousToken,
+      );
 
       await client.connectionStatusStream
           .firstWhere((s) => s == ConnectionStatus.connected)

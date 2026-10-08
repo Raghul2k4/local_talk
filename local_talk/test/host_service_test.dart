@@ -6,6 +6,7 @@ import 'package:local_talk/models/channel.dart';
 import 'package:local_talk/models/message.dart';
 import 'package:local_talk/models/user.dart';
 import 'package:local_talk/services/host_service.dart';
+import 'package:local_talk/utils/constants.dart';
 
 /// A minimal WebSocket client mirroring ClientService's wire protocol.
 class TestClient {
@@ -16,16 +17,38 @@ class TestClient {
   TestClient(this.socket, this.name);
 
   static Future<TestClient> connect(String name, int port,
-      {String? pin}) async {
+      {String? pin, String? roomId, String? token}) async {
     final socket = await WebSocket.connect('ws://127.0.0.1:$port');
     final client = TestClient(socket, name);
     socket.listen(client.received.add);
     client.send(WsMessage(
       type: 'register',
-      data: {'username': name, if (pin != null) 'pin': pin},
+      data: {
+        'username': name,
+        if (pin != null) 'pin': pin,
+        // The host now requires room identity before it will register
+        // anyone. Tests that do not care about it pass the host's own
+        // credentials; the rejection tests deliberately omit or corrupt them.
+        if (roomId != null) 'roomId': roomId,
+        if (token != null) 'token': token,
+      },
     ));
     return client;
   }
+
+  /// Registers against [service] using that host's room credentials.
+  static Future<TestClient> joinHost(
+    String name,
+    HostService service, {
+    String? pin,
+  }) =>
+      connect(
+        name,
+        service.boundPort!,
+        pin: pin,
+        roomId: service.roomId,
+        token: service.joinToken,
+      );
 
   void send(WsMessage msg) => socket.add(jsonEncode(msg.toJson()));
 
@@ -68,7 +91,12 @@ void main() {
     addTearDown(service.stop);
     final port = service.boundPort!;
 
-    final alice = await TestClient.connect('Alice', port);
+    final alice = await TestClient.connect(
+      'Alice',
+      port,
+      roomId: service.roomId,
+      token: service.joinToken,
+    );
     await alice.welcome();
     // Put Alice on the same channel the host starts on.
     alice.send(const WsMessage(
@@ -98,7 +126,12 @@ void main() {
     addTearDown(service.stop);
     final port = service.boundPort!;
 
-    final alice = await TestClient.connect('Alice', port);
+    final alice = await TestClient.connect(
+      'Alice',
+      port,
+      roomId: service.roomId,
+      token: service.joinToken,
+    );
     await alice.welcome();
     alice.send(const WsMessage(
       type: 'join_channel',
@@ -132,13 +165,18 @@ void main() {
     addTearDown(service.stop);
     final port = service.boundPort!;
 
-    final alice = await TestClient.connect('Alice', port);
+    final alice = await TestClient.connect(
+      'Alice',
+      port,
+      roomId: service.roomId,
+      token: service.joinToken,
+    );
     await alice.welcome();
     alice.send(const WsMessage(
       type: 'join_channel',
       data: {'channelId': 'general'},
     ));
-    final bob = await TestClient.connect('Bob', port);
+    final bob = await TestClient.joinHost('Bob', service);
     await bob.welcome();
     bob.send(const WsMessage(
       type: 'join_channel',
@@ -165,6 +203,116 @@ void main() {
     bob.close();
   });
 
+group('room validation', () {
+    Future<HostService> newHost({String? pin}) async {
+      final service = HostService(
+        roomName: 'Guarded',
+        pin: pin,
+        channels: const [Channel(id: 'general', name: 'General')],
+        port: 0,
+      );
+      await service.start();
+      addTearDown(() async {
+        await service.stop();
+        service.dispose();
+      });
+      return service;
+    }
+
+    Future<Map<String, dynamic>> register(
+      HostService service, {
+      String? roomId,
+      String? token,
+      String? pin,
+    }) async {
+      final client = await TestClient.connect(
+        'Probe',
+        service.boundPort!,
+        roomId: roomId,
+        token: token,
+        pin: pin,
+      );
+      addTearDown(client.close);
+      return client.welcome();
+    }
+
+    test('accepts a client with the scanned room credentials', () async {
+      final service = await newHost();
+      final welcome = await register(
+        service,
+        roomId: service.roomId,
+        token: service.joinToken,
+      );
+      expect(
+        welcome.containsKey('channels'),
+        isTrue,
+        reason: 'a valid invite must be welcomed',
+      );
+    });
+
+    test('rejects a client that sends no room credentials', () async {
+      // The regression this guards: anyone who could reach the port used to be
+      // able to register, because only an *optional* PIN stood in the way.
+      final service = await newHost();
+      final welcome = await register(service);
+      expect(welcome['code'], 'room_not_found');
+    });
+
+    test('rejects a wrong token', () async {
+      final service = await newHost();
+      final welcome = await register(
+        service,
+        roomId: service.roomId,
+        token: 'not-the-real-token',
+      );
+      expect(welcome['code'], 'room_not_found');
+    });
+
+    test('rejects a correct token against the wrong room', () async {
+      final service = await newHost();
+      final welcome = await register(
+        service,
+        roomId: 'OTHERROOM',
+        token: service.joinToken,
+      );
+      expect(welcome['code'], 'room_not_found');
+    });
+
+    test('the rejection does not leak the correct secret', () async {
+      final service = await newHost();
+      final welcome = await register(service, roomId: service.roomId);
+      expect(welcome.values.join(' '), isNot(contains(service.joinToken)));
+    });
+
+    test('the PIN is still checked once the room matches', () async {
+      final service = await newHost(pin: '1234');
+      final welcome = await register(
+        service,
+        roomId: service.roomId,
+        token: service.joinToken,
+        pin: '9999',
+      );
+      expect(welcome['code'], 'bad_pin');
+    });
+
+    test('two rooms get different room ids and tokens', () async {
+      final a = await newHost();
+      final b = await newHost();
+      expect(a.roomId, isNot(b.roomId));
+      expect(a.joinToken, isNot(b.joinToken));
+    });
+
+    test('a valid invite for room A is rejected by room B', () async {
+      final a = await newHost();
+      final b = await newHost();
+      final welcome = await register(
+        b,
+        roomId: a.roomId,
+        token: a.joinToken,
+      );
+      expect(welcome['code'], 'room_not_found');
+    });
+  });
   test('ClientService wire protocol: register, list, audio, private call',
       () async {
     final service = HostService(
@@ -178,7 +326,12 @@ void main() {
     final port = service.boundPort!;
 
     // Rooms with a PIN reject wrong pins.
-    final badClient = await TestClient.connect('Bad', port, pin: '0000');
+    // Valid room credentials, wrong PIN: this must fail on the PIN, not on the
+    // room, so the assertion below is still about PINs.
+    final badClient = await TestClient.connect('Bad', port,
+        pin: '0000',
+        roomId: service.roomId,
+        token: service.joinToken);
     final rejected = await badClient.nextWhere(
       (m) => m is String && m.contains('register_rejected'),
     );
@@ -186,14 +339,14 @@ void main() {
     badClient.close();
 
     // Correct pin registers fine.
-    final alice = await TestClient.connect('Alice', port, pin: '1234');
+    final alice = await TestClient.joinHost('Alice', service, pin: '1234');
     final aliceWelcome = await alice.welcome();
     expect(aliceWelcome['roomName'], 'Test Room');
     expect(aliceWelcome['id'], isNotEmpty);
     final hostJson = aliceWelcome['host'] as Map<String, dynamic>;
     expect(hostJson['isHost'], isTrue);
 
-    final bob = await TestClient.connect('Bob', port, pin: '1234');
+    final bob = await TestClient.joinHost('Bob', service, pin: '1234');
     await bob.welcome();
 
     // Wait until the user list includes the host and both clients.
@@ -240,7 +393,8 @@ void main() {
         .nextWhere((m) => m is String && m.contains('private_call_started'));
 
     // A third client listens on the same channel.
-    final carol = await TestClient.connect('Carol', port, pin: '1234');
+    final carol =
+        await TestClient.joinHost('Carol', service, pin: '1234');
     await carol.welcome();
     await carol.nextWhere(
       (m) => m is String && m.contains('"user_list"') && (m).contains('Carol'),
@@ -283,5 +437,89 @@ void main() {
       onlyHostLeft = usersNow.isNotEmpty && usersNow.every((u) => u.isHost);
     }
     expect(onlyHostLeft, isTrue);
+  });
+
+  // ------------------------------------------------------------ audio backpressure
+
+  group('audio backpressure', () {
+    test('drops frames instead of buffering without bound', () async {
+      // Regression: _enqueueAudio used to increment a drop counter and then
+      // still call client.add(). Nothing was ever dropped, so dart:io buffered
+      // until the OS low-memory killer removed the process - the "crash in the
+      // middle of nowhere". A client that never reads must now be refused.
+      final service = HostService(roomName: 'Test Room', port: 0);
+      await service.start();
+      addTearDown(service.stop);
+
+      final alice = await TestClient.joinHost('Alice', service);
+      await alice.welcome();
+      // Registering does not put a client on a channel; it has to ask, like a
+      // real guest does. Without this the host never routes audio to it and
+      // the backpressure ceiling is never exercised.
+      alice.send(const WsMessage(
+        type: 'join_channel',
+        data: {'channelId': 'general'},
+      ));
+      await alice.nextWhere((m) => m is String && m.contains('channel_joined'));
+
+      // A tight burst with no awaits between frames: nothing can drain in that
+      // window, so the ceiling must be reached and enforced. (WebSocket has no
+      // pause(), so the burst itself stands in for a stalled reader.)
+      final frame = List<int>.filled(AppConstants.audioFrameBytes, 0);
+      final before = service.droppedFrames;
+      for (var i = 0; i < 200; i++) {
+        service.broadcastAudio(frame);
+      }
+
+      expect(
+        service.droppedFrames,
+        greaterThan(before),
+        reason: 'a stalled client must cause frames to be dropped, not buffered',
+      );
+      alice.close();
+    });
+
+    test('a healthy client is not starved by the backpressure ceiling', () async {
+      // Regression guard for the ceiling itself. Pending frames are aged out in
+      // real time, so a client that keeps up must never be refused: frames sent
+      // at the real capture rate all have to be delivered.
+      final service = HostService(roomName: 'Test Room', port: 0);
+      await service.start();
+      addTearDown(service.stop);
+
+      final alice = await TestClient.joinHost('Alice', service);
+      await alice.welcome();
+      alice.send(const WsMessage(
+        type: 'join_channel',
+        data: {'channelId': 'general'},
+      ));
+      await alice.nextWhere((m) => m is String && m.contains('channel_joined'));
+
+      service.setHostMicState(true);
+      final before = service.droppedFrames;
+      final frame = List<int>.filled(AppConstants.audioFrameBytes, 0);
+      for (var i = 0; i < 30; i++) {
+        service.broadcastAudio(frame);
+        await Future<void>.delayed(
+          const Duration(milliseconds: AppConstants.audioFrameMs),
+        );
+      }
+
+      expect(
+        service.droppedFrames,
+        before,
+        reason: 'a client keeping pace must not be treated as stalled',
+      );
+      alice.close();
+    });
+
+    test('capture and playback frame durations agree', () {
+      // The jitter buffer only works if capture produces frames at exactly the
+      // rate the drain timer consumes them. 50 ms capture against a 58 ms tick
+      // made latency grow until every arriving frame was dropped - heard as
+      // lag and crackle. audioFrameBytes is derived from the same constant.
+      expect(AppConstants.audioFrameBytes,
+          AppConstants.audioSampleRate * 2 * AppConstants.audioFrameMs ~/ 1000);
+    });
   });
 }

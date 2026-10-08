@@ -17,6 +17,8 @@ From `pubspec.yaml`:
 | `permission_handler` | Runtime mic / location permissions |
 | `connectivity_plus` | Wi-Fi / ethernet check before joining |
 | `wifi_iot` | Programmatic hotspot (Android only) |
+| `qr_flutter` | Rendering the room invite as a QR code |
+| `mobile_scanner` | Guest-side camera QR scanning |
 | `provider` | State management |
 | `shared_preferences` | Remembering name, last host IP, PIN |
 | `uuid` | Room and user identifiers |
@@ -36,11 +38,16 @@ Declared in `android/app/src/main/AndroidManifest.xml`:
 <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
 <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+<uses-permission android:name="android.permission.CAMERA" />
 ```
 
 `ACCESS_FINE_LOCATION` is only needed for hotspot mode — Android gates Wi-Fi
 scanning/toggling behind location from API 29. `host_screen.dart` requests it at
 runtime only when the user enables hotspot mode.
+
+`CAMERA` backs the guest's QR scanner. It is paired with
+`<uses-feature android:name="android.hardware.camera" android:required="false" />`
+so devices without a camera can still install and fall back to manual entry.
 
 `usesCleartextTraffic="true"` is set on the application tag because intercom audio
 travels over plain `ws://`.
@@ -77,14 +84,25 @@ host playback and private-call isolation are all covered without a device.
 
 ### Manual two-device check
 
-1. Install on device A (host) and device B (client).
-2. Connect both to the same Wi-Fi.
-3. On A: **Create a room** -> **Start the room** -> note the `ip:8080` shown.
-4. On B: **Join a room** -> enter that IP and a name -> **Join the room**.
-5. Hold the PTT button on A: B should hear it, and A should *not* echo it back.
-6. Hold PTT on B: A should hear it.
-7. Switch B to a different channel chip and talk: A should hear nothing.
-8. Tap the call icon on B's row for A: both should hear each other and no one else.
+1. Install on device A (host) and device B (guest).
+2. Connect both to the same Wi-Fi (or let A start a hotspot and join B to it).
+3. On A: **Create a room** -> **Start the room**. The QR code appears.
+4. On B: **Join a room** -> enter your name -> **Scan QR code** -> point at A.
+5. Both should show as connected within a second or two.
+6. Hold the PTT button on A: B should hear it, and A should *not* echo it back.
+7. Hold PTT on B: A should hear it.
+8. Switch B to a different channel chip and talk: A should hear nothing.
+9. Tap the call icon on B's row for A: both should hear each other and no one else.
+
+### Manual negative checks
+
+- Turn on a VPN on the host and start a room: the advertised address must stay
+  on the LAN, not switch to the tunnel.
+- Scan a QR from a room the host has already closed: the guest must be told the
+  room is gone and invited to rescan.
+- Deny the microphone, then permanently deny it: the second attempt must offer
+  a trip to system settings rather than failing silently.
+- Deny camera access: scanning must explain itself and offer manual entry.
 
 ## Notes
 

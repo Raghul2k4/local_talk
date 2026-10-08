@@ -7,8 +7,10 @@ import 'package:uuid/uuid.dart';
 
 import '../models/channel.dart';
 import '../models/message.dart';
+import '../models/room_invite.dart';
 import '../models/user.dart';
 import '../utils/constants.dart';
+import '../utils/ip_utils.dart';
 import 'websocket_service.dart';
 
 /// Public identity of the host itself (constant so clients can address it).
@@ -24,7 +26,21 @@ class HostService implements WebSocketService {
   final String _roomName;
   final String? _pin;
   final String _roomId;
+
+  /// Per-room secret that guests must present to register.
+  ///
+  /// Generated fresh for every room and never persisted. Combined with the
+  /// room id it means a device that merely happens to be on the same subnet —
+  /// or that replays a QR from an earlier room — cannot silently join this one.
+  final String _joinToken;
   final List<Channel> _channels;
+
+  /// The address verified as reachable after [start], or null if verification
+  /// found nothing usable. The UI shows this instead of re-deriving an IP.
+  HostAddress? _advertisedAddress;
+
+  /// Why address detection failed, if it did.
+  String? _addressError;
 
   // Private call state (at most one active pair in v1).
   String? _privateCallCallerId;
@@ -40,9 +56,47 @@ class HostService implements WebSocketService {
   /// Drives the "is speaking" indicator.
   final Map<String, DateTime> _lastAudible = <String, DateTime>{};
 
-  /// Audio frames handed to a socket since its last heartbeat acknowledgement.
+  /// Audio frames handed to a socket but not yet accounted for as played.
   /// Drives backpressure; see [_enqueueAudio].
   final Map<WebSocket, int> _pendingFrames = <WebSocket, int>{};
+
+  /// When [_pendingFrames] was last decayed for each socket.
+  ///
+  /// The count has to be aged in real time. Resetting it only on the 10 s
+  /// heartbeat cannot work: at ~17 frames/s a perfectly healthy client has
+  /// ~170 frames outstanding by the next heartbeat, far past any sane limit, so
+  /// the ceiling would be breached constantly and good audio thrown away.
+  final Map<WebSocket, DateTime> _pendingDecayAt = <WebSocket, DateTime>{};
+
+  /// Frames a socket is allowed to have outstanding before we stop feeding it.
+  ///
+  /// ~24 frames is ~1.4 s of audio: enough that a briefly busy client (a GC
+  /// pause, a Wi-Fi blip) recovers without losing audio, while still bounding
+  /// memory on a client that has genuinely stopped reading.
+  static const int _maxPendingFrames = 24;
+
+  /// Retires frames that the client has had time to play.
+  ///
+  /// `dart:io` gives no socket-buffer size, so this estimates consumption from
+  /// elapsed time rather than measuring it: if N frames have been outstanding
+  /// for T ms, roughly T / [AppConstants.audioFrameMs] of them have drained.
+  int _decayedPending(WebSocket client) {
+    final pending = _pendingFrames[client] ?? 0;
+    if (pending == 0) return 0;
+    final now = DateTime.now();
+    final last = _pendingDecayAt[client];
+    if (last == null) {
+      _pendingDecayAt[client] = now;
+      return pending;
+    }
+    final elapsedMs = now.difference(last).inMilliseconds;
+    if (elapsedMs <= 0) return pending;
+    _pendingDecayAt[client] = now;
+    final drained = elapsedMs ~/ AppConstants.audioFrameMs;
+    if (drained <= 0) return pending;
+    final left = pending - drained;
+    return left > 0 ? left : 0;
+  }
 
   /// Set when a user's speaking state changed and the list still needs pushing.
   /// Coalesced by [_speakingBroadcastTimer] so a burst of speech toggles
@@ -80,9 +134,16 @@ class HostService implements WebSocketService {
     String? pin,
     List<Channel>? channels,
     this.port = AppConstants.wsPort,
+    String? roomId,
+    String? joinToken,
   })  : _roomName = roomName.trim().isEmpty ? 'My Room' : roomName.trim(),
         _pin = (pin == null || pin.isEmpty) ? null : pin,
-        _roomId = const Uuid().v4().substring(0, 8).toUpperCase(),
+        // Generated per room in normal use. The optional overrides exist so a
+        // test can restart a host as the *same* room and exercise the client's
+        // reconnect path; production never passes them, so a new room always
+        // gets fresh credentials.
+        _roomId = roomId ?? const Uuid().v4().substring(0, 8).toUpperCase(),
+        _joinToken = joinToken ?? const Uuid().v4(),
         _channels = channels ??
             AppConstants.defaultChannels
                 .map((name) => Channel(
@@ -122,6 +183,32 @@ class HostService implements WebSocketService {
   String get roomId => _roomId;
   bool get hasPin => _pin != null;
 
+  /// The secret a guest must present. Kept internal to the app; it is only
+  /// ever published inside a [RoomInvite].
+  String get joinToken => _joinToken;
+
+  /// The verified address to advertise, or null when detection failed.
+  HostAddress? get advertisedAddress => _advertisedAddress;
+
+  /// User-facing reason the address could not be determined, if applicable.
+  String? get addressError => _addressError;
+
+  /// The full invite payload for the QR code.
+  ///
+  /// Returns null until [start] has succeeded and bound a port, because a QR
+  /// containing a port the server is not listening on is worse than no QR.
+  RoomInvite? get invite {
+    final address = _advertisedAddress;
+    final bound = boundPort;
+    if (address == null || bound == null) return null;
+    return RoomInvite(
+      ip: address.ip,
+      port: bound,
+      roomId: _roomId,
+      token: _joinToken,
+    );
+  }
+
   @override
   Stream<List<User>> get usersStream => _usersController.stream;
 
@@ -148,8 +235,15 @@ class HostService implements WebSocketService {
   @override
   bool get isRunning => _server != null;
 
+  /// Whether guests are expected to join through a hotspot started by us.
+  ///
+  /// Set before [start] so address detection picks the AP interface rather
+  /// than the station-mode one that just went away.
+  bool hotspotExpected = false;
+
   @override
   Future<void> start() async {
+    _addressError = null;
     try {
       _server = await HttpServer.bind(
         InternetAddress.anyIPv4,
@@ -168,6 +262,46 @@ class HostService implements WebSocketService {
       _connectionStatusController.add(ConnectionStatus.disconnected);
       rethrow;
     }
+
+    // Binding is not the same as being reachable. `anyIPv4` listens on every
+    // interface, so the server is up even when the address we would advertise
+    // belongs to a VPN or the cellular radio. Detect and verify *after* the
+    // bind so the room is never shown as ready with an address no guest can
+    // dial.
+    await _resolveAdvertisedAddress();
+  }
+
+  /// Picks the address to publish, and refuses to invent one.
+  ///
+  /// The cross-check against [IpUtils.localIpv4Addresses] is the guard that
+  /// would have caught the original bug: the old code advertised whichever
+  /// private address the kernel listed first, which was frequently a `tun0`
+  /// VPN address that exists only on this device.
+  Future<void> _resolveAdvertisedAddress() async {
+    final selected = await IpUtils.detectHostAddress(
+      hotspotActive: hotspotExpected,
+    );
+
+    if (selected == null) {
+      _advertisedAddress = null;
+      _addressError =
+          'This device has no local network other devices can reach. Connect '
+          'to Wi-Fi, or turn on a hotspot, then start the room again.';
+      return;
+    }
+
+    // Confirm the address really belongs to us before publishing it.
+    final local = await IpUtils.localIpv4Addresses();
+    if (local.isNotEmpty && !local.contains(selected.ip)) {
+      _advertisedAddress = null;
+      _addressError =
+          'Could not work out an address other devices can reach on this '
+          'network. Turn off any VPN, or turn on a hotspot, then start the '
+          'room again.';
+      return;
+    }
+
+    _advertisedAddress = selected;
   }
 
   void _startHeartbeat() {
@@ -184,10 +318,8 @@ class HostService implements WebSocketService {
       data: {'timestamp': DateTime.now().millisecondsSinceEpoch},
     );
     for (final client in List.of(_clients)) {
-      // Anything we send proves the client may still be reachable, and it
-      // resets the backpressure accounting.
+      // Anything we send proves the client may still be reachable.
       _lastSeen[client] = DateTime.now();
-      _pendingFrames[client] = 0;
       _sendTo(client, msg);
     }
     _evictStaleClients();
@@ -252,6 +384,7 @@ class HostService implements WebSocketService {
         _clients.add(socket);
         _lastSeen[socket] = DateTime.now();
         _pendingFrames[socket] = 0;
+        _pendingDecayAt[socket] = DateTime.now();
         // A socket that connects but never registers would otherwise sit here
         // holding memory. The timer is cancelled on the first frame, which is
         // always `register` in practice.
@@ -365,6 +498,31 @@ class HostService implements WebSocketService {
                 : rawUsername.length,
           );
     final pin = data['pin'] as String?;
+
+    // Room/session validation. Without this the only thing standing between a
+    // stranger on the same café Wi-Fi and a live room was an *optional* PIN.
+    // The token travels in the host's QR, so a genuine guest always has it and
+    // a scanner or a guess does not.
+    final roomId = data['roomId'] as String?;
+    final token = data['token'] as String?;
+    if (roomId != _roomId || token != _joinToken) {
+      // Say "the room is gone" rather than "your token is wrong": a guest
+      // holding a stale QR should be told to rescan, and a probe learns
+      // nothing about the correct secret.
+      _sendTo(
+        socket,
+        const WsMessage(
+          type: 'register_rejected',
+          data: {
+            'message': 'This room is no longer running. Scan the host\'s '
+                'current QR code to join.',
+            'code': 'room_not_found',
+          },
+        ),
+      );
+      socket.close(1008, 'Room not found');
+      return;
+    }
 
     if (_pin != null && pin != _pin) {
       _sendTo(
@@ -640,7 +798,12 @@ class HostService implements WebSocketService {
         ? hostPartner == senderUser.id
         : senderPartner == null &&
             _sameChannel(_hostChannelId, senderUser.currentChannelId);
-    if (hostShouldHear) {
+    // A socket frame can still be delivered while the room is being torn down
+    // (`stop()` closes clients, but a frame already in flight still lands).
+    // Adding to a closed StreamController throws, and that throw happens in an
+    // async socket callback with nobody to catch it, so it takes the whole app
+    // down mid-call. Dropping the frame is the correct behaviour anyway.
+    if (hostShouldHear && !_disposed) {
       _audioController.add(audio);
     }
 
@@ -748,6 +911,7 @@ class HostService implements WebSocketService {
     if (!existed) return;
     _lastSeen.remove(socket);
     _pendingFrames.remove(socket);
+    _pendingDecayAt.remove(socket);
     final user = _clientUsers[socket];
     if (user != null) {
       _usersById.remove(user.id);
@@ -844,22 +1008,29 @@ class HostService implements WebSocketService {
 
   /// Writes an audio frame to a client, applying backpressure.
   ///
-  /// `dart:io` does not expose a socket's pending-buffer size, so we track
-  /// how many frames we have handed to a client but not seen acknowledged
-  /// (each client answers our heartbeat). A client that has fallen more than
-  /// [AppConstants.maxQueuedAudioFrames] behind gets its oldest frames
+  /// `dart:io` does not expose a socket's pending-buffer size, so outstanding
+  /// frames are aged out by elapsed time instead (see [_decayedPending]). A
+  /// client that stays more than [_maxPendingFrames] behind gets the *new* frame
   /// dropped rather than being allowed to consume unbounded memory.
+  ///
+  /// The original version incremented a counter but still called
+  /// `client.add(data)`, so nothing was ever actually dropped: `dart:io` kept
+  /// buffering, memory climbed until the process was killed by the low-memory
+  /// killer. That is the "crash in the middle of nowhere" - it never surfaces
+  /// as a Dart error, the app just vanishes. Refusing the frame is the only
+  /// real backpressure available here.
   bool _enqueueAudio(WebSocket client, List<int> data) {
-    final pending = (_pendingFrames[client] ?? 0) + 1;
-    if (pending > AppConstants.maxQueuedAudioFrames) {
+    final pending = _decayedPending(client);
+    if (pending >= _maxPendingFrames) {
       _droppedFrames++;
+      return false;
     }
-    _pendingFrames[client] = pending;
+    _pendingFrames[client] = pending + 1;
     try {
       client.add(data);
       return true;
     } catch (e) {
-      _pendingFrames[client] = (_pendingFrames[client] ?? 1) - 1;
+      _pendingFrames[client] = pending;
       _errorController.add('Broadcast error: $e');
       return false;
     }
@@ -891,6 +1062,7 @@ class HostService implements WebSocketService {
     _usersById.clear();
     _lastSeen.clear();
     _pendingFrames.clear();
+    _pendingDecayAt.clear();
     _lastAudible.clear();
     _clearPrivateCall();
     try {
